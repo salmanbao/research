@@ -1,0 +1,28 @@
+{
+  "name": "iota",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start:kafka": "node kafka-environment/src/index.js",
+    "start:rabbitmq": "node rabbitmq-environment/src/index.js",
+    "start:all": "concurrently \"npm run start:kafka\" \"npm run start:rabbitmq\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@iota/sdk": "^1.1.5",
+    "@noble/hashes": "^1.8.0",
+    "amqplib": "^0.10.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "kafkajs": "^2.2.4",
+    "merkletreejs": "^0.4.1",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
