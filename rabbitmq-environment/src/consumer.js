@@ -1,50 +1,46 @@
 const amqp = require('amqplib');
 const { broadcastTx } = require('../../utils/tendermint');
+const fs = require('fs');
+const path = require('path');
 const config = require('./config');
 
+// Tendermint processing consumer (queue: myQueue-tendermint)
 async function consumeFromQueueInBatches() {
   const connection = await amqp.connect(config.connection.url, config.connection.options);
   const channel = await connection.createChannel();
-  const queue = config.queue.name;
-  const batchSize = config.consumer.prefetch;
+  const queue = 'myQueue-tendermint';
 
   // Make sure the queue exists
   await channel.assertQueue(queue, config.queue.options);
-  await channel.prefetch(batchSize);
+  await channel.prefetch(5); // Increased parallelism
 
-  console.log(`[*] Waiting for messages in ${queue}. Batch size = ${batchSize}`);
-
-  let currentBatch = [];
+  console.log(`[*] Waiting for batch messages in ${queue}. Each message is a batch.`);
 
   channel.consume(
     queue,
     async (msg) => {
       if (msg !== null) {
         try {
-          // Add message to current batch
-          currentBatch.push(msg);
-          // If we have reached the batch size, process the batch
-          if (currentBatch.length >= batchSize) {
-            const batch = [...currentBatch];
-            currentBatch = [];
-            const blockIds = batch.map((m) => JSON.parse(m.content.toString()).data.blockId);
-            const timestamp = Date.now();
+          // Parse the batch (array of IOTA responses)
+          const batch = JSON.parse(msg.content.toString());
+          if (!Array.isArray(batch)) {
+            throw new Error('Received message is not a batch array');
+          }
+          const blockIds = batch.map(item => item.blockId).filter(Boolean);
+          const timestamp = Date.now();
 
-            console.log(`[+] Got ${batchSize} messages, broadcasting...`);
+          console.log(`[+] Received batch of size ${batch.length}, broadcasting...`);
 
-            try {
-              await broadcastTx(blockIds, timestamp);
-              // Acknowledge all messages in the batch
-              batch.forEach((m) => channel.ack(m));
-              console.log("[✓] Broadcast complete, all messages acknowledged.");
-            } catch (error) {
-              console.error("[x] Broadcast failed!", error);
-              // If broadcast fails, reject all messages in the batch
-              batch.forEach((m) => channel.nack(m, false, true));
-            }
+          try {
+            await broadcastTx(blockIds, timestamp);
+            channel.ack(msg);
+            console.log(`[✓] Broadcast complete for batch of size ${batch.length}.`);
+          } catch (error) {
+            console.error('[x] Broadcast failed for batch!', error);
+            channel.nack(msg, false, true);
           }
         } catch (error) {
-          console.error("[x] Error processing message:", error);
+          console.error('[x] Error processing batch message:', error);
           channel.nack(msg, false, true);
         }
       }
@@ -77,4 +73,82 @@ async function consumeFromQueueInBatches() {
   return { connection, channel };
 }
 
-module.exports = { consumeFromQueueInBatches }; 
+// Independent file-writing consumer (queue: myQueue-file)
+async function consumeAndWriteBatchesToFile() {
+  const connection = await amqp.connect(config.connection.url, config.connection.options);
+  const channel = await connection.createChannel();
+  const queue = 'myQueue-file';
+  const filePath = path.resolve(__dirname, '../../batches.json');
+
+  // Ensure the file exists
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, JSON.stringify([]));
+  }
+
+  await channel.assertQueue(queue, config.queue.options);
+  await channel.prefetch(5); // Parallelism for file writing
+
+  console.log(`[*] File-writing consumer waiting for batch messages in ${queue}. Each message is a batch.`);
+
+  channel.consume(
+    queue,
+    async (msg) => {
+      if (msg !== null) {
+        try {
+          const batch = JSON.parse(msg.content.toString());
+          if (!Array.isArray(batch)) {
+            throw new Error('Received message is not a batch array');
+          }
+          // Read, append, and write asynchronously
+          try {
+            const fileContent = await fs.promises.readFile(filePath, 'utf-8');
+            let batches = [];
+            try {
+              batches = JSON.parse(fileContent);
+              if (!Array.isArray(batches)) batches = [];
+            } catch (err) {
+              batches = [];
+            }
+            batches = batches.concat(batch);
+            fs.writeFileSync(filePath, JSON.stringify(batches, null, 2));
+            channel.ack(msg);
+            console.log(`[✓] Batch of size ${batch.length} written to file.`);
+          } catch (err) {
+            console.error('[x] Failed to write batch to file:', err);
+            channel.nack(msg, false, true);
+          }
+        } catch (error) {
+          console.error('[x] Error processing batch message for file writing:', error);
+          channel.nack(msg, false, true);
+        }
+      }
+    },
+    { noAck: config.consumer.noAck }
+  );
+
+  // Handle graceful shutdown
+  const errorTypes = ['unhandledRejection', 'uncaughtException'];
+  const signalTraps = ['SIGTERM', 'SIGINT', 'SIGUSR2'];
+
+  errorTypes.forEach(type => {
+    process.on(type, async () => {
+      console.log('[*] Shutting down file-writing consumer...');
+      await channel.close();
+      await connection.close();
+      process.exit(0);
+    });
+  });
+
+  signalTraps.forEach(type => {
+    process.once(type, async () => {
+      console.log('[*] Received shutdown signal, cleaning up file-writing consumer...');
+      await channel.close();
+      await connection.close();
+      process.exit(0);
+    });
+  });
+
+  return { connection, channel };
+}
+
+module.exports = { consumeFromQueueInBatches, consumeAndWriteBatchesToFile }; 

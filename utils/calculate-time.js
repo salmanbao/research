@@ -1,9 +1,6 @@
 const fs = require("fs"); // Only if using Node.js
-const firstObjectArray = require('./Electricity.json')
-const secondObjectArray = require('./Gas.json')
-const thirdObjectArray = require('./Water.json')
-const secondObject = require('./blockMapping.json')
-const blockMapping = require('./blockMapping.json');
+const firstObjectArray = require('../batches.json')
+const blockMapping = require('../blockMapping.json')
 
 function calculateTimeDifferences(arrayOfObjects, validationObj) {
     const allDifferences = [];
@@ -15,7 +12,7 @@ function calculateTimeDifferences(arrayOfObjects, validationObj) {
         const differences = arrayOfObjects
             .filter(item => validatingObj.blockIds.includes(item.blockId))
             .map(item => {
-                const initialTime = new Date(item.timestamp);
+                const initialTime = new Date(item.sendingTimestampToIota);
                 const differenceMs = validationTime - initialTime;
                 return differenceMs / 1000; // Convert to seconds
             });
@@ -54,9 +51,9 @@ function calculateTotalBlockIds() {
   }
 
 // Combine arrays more efficiently
-const allObjects = [...firstObjectArray, ...secondObjectArray, ...thirdObjectArray];
-const results = calculateTimeDifferences(allObjects, secondObject);
+const allObjects = [...firstObjectArray];
+const results = calculateTimeDifferences(allObjects, blockMapping);
 calculateTotalBlockIds()
 // Write results to file
-fs.writeFileSync('batch-100-tx-300.json', JSON.stringify({ results }, null, 2));
+fs.writeFileSync('batch-dynamic-tx-300.json', JSON.stringify({ results }, null, 2));
   

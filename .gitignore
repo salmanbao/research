@@ -1,15 +1,16 @@
 # Buildable files
+.cursorignore
 logs
 node_modules
 tangles/private_tangle_1/bootstrap
 tangles/private_tangle_1/privatedb
-tangles/private_tangle_1/snapshot
+tangles/private_tangle_1/snapshots
 
 
 tangles/private_tangle_2/bootstrap
 tangles/private_tangle_2/privatedb
-tangles/private_tangle_2/snapshot
+tangles/private_tangle_2/snapshots
 
 tangles/private_tangle_3/bootstrap
 tangles/private_tangle_3/privatedb
-tangles/private_tangle_3/snapshot
+tangles/private_tangle_3/snapshots

@@ -15,14 +15,15 @@ app.post("/store", async (req, res) => {
   const { tag, data } = req.body;
   if (!tag || !data)
     return res.status(400).json({ error: "Missing body attributes" });
-  const { blockId, timestamp } = await storeData(tag, data);
+  const { blockId, sendingTimestampToIota, completionTimestampFromIota } = await storeData(tag, data);
   blockId == undefined
     ? res.status(500).json({
         message: "Establishing connection with IOTA Node...",
       })
     : res.json({
         message: `${tag} IoT device's data stored successfully!`,
-        timestamp,
+        sendingTimestampToIota,
+        completionTimestampFromIota,
         blockId,
       });
 });

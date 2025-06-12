@@ -13,7 +13,7 @@ module.exports = {
     }
   },
   consumer: {
-    prefetch: 100, // Batch size
+    prefetch: 10, // Batch size
     noAck: false,
   }
 }; 

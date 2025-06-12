@@ -1,10 +1,11 @@
 const fs = require("fs");
 const { Kafka, Partitioners } = require("kafkajs");
 const amqp = require('amqplib');
+const path = require('path');
 
 // Configuration
 const config = {
-  messageBroker: 'kafka', // 'kafka' or 'rabbitmq'
+  messageBroker: 'rabbitmq', // 'kafka' or 'rabbitmq'
   kafka: {
     broker: "localhost:9093",
     topic: "myTopic",
@@ -45,6 +46,9 @@ async function call(data) {
  ************************************/
 
 function generateData(tag) {
+  // Assign priority randomly for demonstration
+  const priorities = ["high", "medium", "low"];
+  const priority = priorities[randInt(0, 2)];
   switch (tag) {
     case "Electricity":
       return {
@@ -59,8 +63,8 @@ function generateData(tag) {
           longitude: rand(-133, 133).toFixed(4),
         },
         firmwareVersion: "2.13.6",
+        priority,
       };
-
     case "Gas":
       return {
         deviceId: "sensor_002",
@@ -73,8 +77,8 @@ function generateData(tag) {
           longitude: rand(-133, 133).toFixed(4),
         },
         firmwareVersion: "4.4.0",
+        priority,
       };
-
     case "Water":
       return {
         deviceId: "sensor_003",
@@ -93,8 +97,8 @@ function generateData(tag) {
           longitude: rand(-133, 133).toFixed(4),
         },
         firmwareVersion: "2.13.6",
+        priority,
       };
-
     default:
       throw new Error(`Unknown tag: ${tag}`);
   }
@@ -199,83 +203,251 @@ class MessageBroker {
 
     console.log(`[x] Sent to RabbitMQ: ${JSON.stringify(message)}`);
   }
+
+  async sendMessageToQueue(message, queueName) {
+    if (config.messageBroker === 'rabbitmq') {
+      await this.rabbitmqChannel.assertQueue(queueName, { durable: true });
+      await this.rabbitmqChannel.sendToQueue(queueName, Buffer.from(JSON.stringify(message)), { persistent: true });
+    }
+    // ... (Kafka logic if needed)
+  }
 }
 
 /************************************
  * Request + Save
  ************************************/
 
-async function requestAndSave(tag, messageBroker) {
-  try {
-    // 1) Generate data
-    const dataPayload = generateData(tag);
+async function requestAndSave(tag, dataPayload) {
+  // Add timestamp to the payload here if needed (if not already present)
+  // For now, just send to IOTA and return the response with the original payload
+  const payloadWithTimestamp = {
+    ...dataPayload,
+  };
+  const response = await call({ tag, data: payloadWithTimestamp });
+  // Return both the response and the payload for batching
+  return { ...response, payload: payloadWithTimestamp };
+}
 
-    // 2) Send request
-    const response = await call({ tag, data: dataPayload });
-
-    // 4) Publish the response to message broker
-    await messageBroker.sendMessage({
-      tag,
-      data: response,
-    });
-
-    // 3) Save response to file
-    let existingData = [];
-    try {
-      const fileContent = fs.readFileSync(`${tag}.json`, "utf-8");
-      existingData = JSON.parse(fileContent);
-      if (!Array.isArray(existingData)) {
-        existingData = [];
-      }
-    } catch (err) {
-      existingData = [];
+class BatchManager {
+  constructor({ messageBroker, batchFile = 'batches.json', batchSize = 10 }) {
+    this.messageBroker = messageBroker;
+    this.batchFile = batchFile;
+    this.batchSize = batchSize;
+    this.pendingBatch = [];
+    this.filePath = path.resolve(__dirname, '..', this.batchFile);
+    // Ensure the file exists (optional, for legacy)
+    if (!fs.existsSync(this.filePath)) {
+      fs.writeFileSync(this.filePath, JSON.stringify([]));
     }
+  }
 
-    existingData.push(response);
-    fs.writeFileSync(`${tag}.json`, JSON.stringify(existingData, null, 2));
+  async handleBatch(batch) {
+    if (!batch || batch.length === 0) return;
+    // Prepare batch data (array of iotaResponse objects)
+    const batchData = batch.map(item => item.iotaResponse);
+    try {
+      // Two-queue approach: send batch to both queues
+      await this.messageBroker.sendMessageToQueue(batchData, 'myQueue-tendermint');
+      await this.messageBroker.sendMessageToQueue(batchData, 'myQueue-file');
+      // File writing is now handled by the independent consumer (consumeAndWriteBatchesToFile)
+    } catch (err) {
+      // Discard batch on error
+      console.error('[BatchManager] Failed to queue batch, discarding:', err);
+    }
+  }
 
+  // appendBatchToFile removed: file writing is now handled by the consumer
+}
 
-  } catch (error) {
-    console.error(`Error in requestAndSave for ${tag}`, error);
-    throw error;
+/**
+ * Parallel-Aware Priority Scheduler
+ */
+class PriorityScheduler {
+  constructor({ batchSize = 10, parallelism = 3, agingMs = 5000, batchManager = null } = {}) {
+    this.queues = {
+      high: [],
+      medium: [],
+      low: [],
+    };
+    this.batchSize = batchSize;
+    this.parallelism = parallelism;
+    this.agingMs = agingMs;
+    this.activeBatches = 0;
+    this.totalProcessed = 0;
+    this.totalDropped = 0;
+    this.resolve = null;
+    this.donePromise = new Promise((resolve) => (this.resolve = resolve));
+    this.running = false;
+    this.timer = null;
+    this.batchManager = batchManager;
+    // Load-aware batching parameters
+    this.minBatchSize = 100;
+    this.maxBatchSize = 500;
+    this.loadCheckIntervalMs = 1000;
+    this.lastLoadCheck = Date.now();
+  }
+
+  /**
+   * Adjust batch size based on total queue length (load-aware batching)
+   */
+  adjustBatchSize() {
+    const totalQueueLength = this.queues.high.length + this.queues.medium.length + this.queues.low.length;
+    if (totalQueueLength > this.batchSize * 3) {
+      // High load: increase batch size
+      this.batchSize = Math.min(this.batchSize + 5, this.maxBatchSize);
+    } else if (totalQueueLength < this.batchSize) {
+      // Low load: decrease batch size
+      this.batchSize = Math.max(this.batchSize - 5, this.minBatchSize);
+    }
+    // Optionally, log for monitoring
+    // console.log(`Adjusted batch size: ${this.batchSize} (Queue: ${totalQueueLength})`);
+  }
+
+  /**
+   * Schedule a new request.
+   * @param {object} request
+   */
+  schedule(request) {
+    const { priority } = request.data;
+    const entry = { ...request, enqueuedAt: Date.now() };
+    this.queues[priority].push(entry);
+    if (!this.running) {
+      this.running = true;
+      this.run();
+    }
+  }
+
+  /**
+   * Promote aged requests to higher priority.
+   */
+  promoteAgedRequests() {
+    const now = Date.now();
+    // Promote from low to medium
+    this.queues.low = this.queues.low.filter((item) => {
+      if (now - item.enqueuedAt > this.agingMs) {
+        item.data.priority = "medium";
+        this.queues.medium.push(item);
+        return false;
+      }
+      return true;
+    });
+    // Promote from medium to high
+    this.queues.medium = this.queues.medium.filter((item) => {
+      if (now - item.enqueuedAt > this.agingMs * 2) {
+        item.data.priority = "high";
+        this.queues.high.push(item);
+        return false;
+      }
+      return true;
+    });
+  }
+
+  /**
+   * Run the scheduler loop.
+   */
+  async run() {
+    this.timer = setInterval(() => this.promoteAgedRequests(), 1000);
+    while (
+      this.queues.high.length ||
+      this.queues.medium.length ||
+      this.queues.low.length ||
+      this.activeBatches > 0
+    ) {
+      // Periodically adjust batch size based on queue length
+      if (Date.now() - this.lastLoadCheck > this.loadCheckIntervalMs) {
+        this.adjustBatchSize();
+        this.lastLoadCheck = Date.now();
+      }
+      while (this.activeBatches < this.parallelism) {
+        const batch = this.getNextBatch();
+        if (!batch.length) break;
+        this.activeBatches++;
+        this.processBatch(batch)
+          .then(() => {
+            this.activeBatches--;
+          })
+          .catch(() => {
+            this.activeBatches--;
+            this.totalDropped += batch.length;
+          });
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    clearInterval(this.timer);
+    this.resolve();
+  }
+
+  /**
+   * Get the next batch based on priority.
+   */
+  getNextBatch() {
+    for (const level of ["high", "medium", "low"]) {
+      if (this.queues[level].length) {
+        // Dynamic batch size: up to batchSize or all available
+        const size = Math.min(this.batchSize, this.queues[level].length);
+        return this.queues[level].splice(0, size);
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Process a batch: send to IOTA and handle results.
+   */
+  async processBatch(batch) {
+    // Process all requests in the batch in parallel
+    const results = await Promise.all(
+      batch.map(async (item) => {
+        try {
+          // Only send to IOTA and return the response
+          const iotaResponse = await requestAndSave(item.tag, item.data);
+          this.totalProcessed++;
+          return { iotaResponse };
+        } catch (err) {
+          // Drop failed requests
+          this.totalDropped++;
+          return null;
+        }
+      })
+    );
+    // Filter out failed responses
+    const successfulBatch = results.filter(r => r !== null);
+    // Pass successfulBatch to BatchManager for queueing and file writing
+    if (this.batchManager) {
+      await this.batchManager.handleBatch(successfulBatch);
+    }
+  }
+
+  /**
+   * Wait for all scheduled requests to finish.
+   */
+  async waitUntilDone() {
+    await this.donePromise;
   }
 }
 
-/************************************
- * Send 100 Requests Simultaneously
- ************************************/
-
+// Refactored sendSimultaneousRequests
 async function sendSimultaneousRequests() {
   const messageBroker = new MessageBroker();
   await messageBroker.connect();
-
   const tags = ["Electricity", "Gas", "Water"];
-  const promises = [];
-
-  for (let i = 0; i < 1000; i++) {
+  const totalRequests = 300 * tags.length;
+  const batchSize = 100;
+  const batchManager = new BatchManager({ messageBroker, batchFile: 'batches.json', batchSize });
+  const scheduler = new PriorityScheduler({ batchSize, parallelism: 3, agingMs: 5000, batchManager });
+  for (let i = 0; i < 300; i++) {
     for (const tag of tags) {
-      promises.push(requestAndSave(tag, messageBroker));
+      const data = generateData(tag);
+      scheduler.schedule({ tag, data, messageBroker });
     }
   }
-
-  // Wait until all requests complete
-  console.log("Total promises created:", promises.length);
-  const results = await Promise.allSettled(promises);
-  
-  // Calculate and print detailed statistics
-  const resolvedPromises = results.filter(p => p.status === "fulfilled");
-  const rejectedPromises = results.filter(p => p.status === "rejected");
-  
-  console.log("\n=== Promise Resolution Statistics ===");
-  console.log(`Total Promises: ${results.length}`);
-  console.log(`Resolved Promises: ${resolvedPromises.length} (${((resolvedPromises.length/results.length)*100).toFixed(2)}%)`);
-  console.log(`Rejected Promises: ${rejectedPromises.length} (${((rejectedPromises.length/results.length)*100).toFixed(2)}%)`);
-  
-
+  await scheduler.waitUntilDone();
+  console.log("\n=== Scheduler Statistics ===");
+  console.log(`Total Requests: ${totalRequests}`);
+  console.log(`Processed: ${scheduler.totalProcessed}`);
+  console.log(`Dropped: ${scheduler.totalDropped}`);
   await messageBroker.disconnect();
 }
-
-
 
 // Export configuration for external use
 module.exports = {

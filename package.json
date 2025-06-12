@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "iota": "node index.js",
+    "data": "node utils/data.js",
+    "calculate-time": "node utils/calculate-time.js",
     "start:kafka": "node kafka-environment/src/index.js",
     "start:rabbitmq": "node rabbitmq-environment/src/index.js",
     "start:all": "concurrently \"npm run start:kafka\" \"npm run start:rabbitmq\""
