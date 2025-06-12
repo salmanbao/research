@@ -32,7 +32,7 @@ async function storeData(tag, data) {
     })
   )
   if (!domain) return null;
-  const timestamp = Date.now();
+  const sendingTimestampToIota = Date.now();
   const response = await fetch(`${domain}/api/core/v2/blocks`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -46,7 +46,8 @@ async function storeData(tag, data) {
     }),
   });
   const blockId = (await response.json()).blockId;
-  return { blockId, timestamp };
+  const completionTimestampFromIota = Date.now();
+  return { blockId, sendingTimestampToIota ,completionTimestampFromIota};
 }
 
 async function queryData(tag, blockId) {

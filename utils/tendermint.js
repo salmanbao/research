@@ -8,7 +8,7 @@ const TENDERMINT_URL = "http://localhost:26657";
 // Cache for block mappings to reduce file I/O
 const blockMappingCache = new Map();
 const CACHE_FLUSH_INTERVAL = 5000; // 5 seconds
-const MAX_PENDING_WRITES = 50; // Force flush after 50 pending writes
+const MAX_PENDING_WRITES = 2; // Force flush after 10 pending writes
 let lastCacheFlush = Date.now();
 
 // Batch file writes
@@ -77,7 +77,7 @@ async function queryTimedMerkleTree(key) {
 // Function to broadcast a transaction (Merkle Tree)
 async function broadcastTx(blockIds, timestamp) {
   if (!blockIds || blockIds.length === 0) return;
-  
+  let completionTimestampFromTendermint = null;
   const startTime = Date.now();
   console.log(`[Broadcast] Processing ${blockIds.length} block IDs`);
 
@@ -89,6 +89,7 @@ async function broadcastTx(blockIds, timestamp) {
     const hashedIds = await Promise.all(
       blockIds.map(async (x) => hash(x))
     );
+
     const txData = `${timestampKey}=${hashedIds}`;
 
     // 3) Send to Tendermint with retry logic
@@ -101,6 +102,7 @@ async function broadcastTx(blockIds, timestamp) {
         result = await fetchTendermintRPC(
           `/broadcast_tx_commit?tx="${txData}"`
         );
+        completionTimestampFromTendermint = Date.now();
         break;
       } catch (err) {
         retryCount++;
@@ -123,7 +125,7 @@ async function broadcastTx(blockIds, timestamp) {
     // 5) Store mapping with optimized file I/O
     const mappingData = {
       timestampKey,
-      validationTime: Date.now(),
+      validationTime: completionTimestampFromTendermint,
       blockIds,
       hashedIds,
       processingTime: Date.now() - startTime
